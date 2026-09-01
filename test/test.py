@@ -83,10 +83,12 @@ class Memory:
     keeps no model of the cache at all.
     """
 
-    def __init__(self, dut, bus, latency=MEM_LATENCY):
+    def __init__(self, dut, bus, latency=MEM_LATENCY, ack_cycles=1, jitter=None):
         self.dut = dut
         self.bus = bus
         self.latency = latency
+        self.ack_cycles = ack_cycles
+        self.jitter = jitter  # rng for a randomly varying response time
         self.words = golden_memory()
         self.fills = 0
         self.writebacks = 0
@@ -101,7 +103,7 @@ class Memory:
                 # Eviction. The address and the data are both on the pins.
                 addr = uo & 0x1F
                 data = int(dut.uio_out.value)
-                await ClockCycles(dut.clk, self.latency)
+                await self._delay()
                 self.words[addr] = data
                 self.writebacks += 1
                 await self._ack()
@@ -109,15 +111,20 @@ class Memory:
             elif bit(uo, MEM_REQ):
                 # Fill. The cache tells us which word it wants.
                 addr = uo & 0x1F
-                await ClockCycles(dut.clk, self.latency)
+                await self._delay()
                 self.bus.data = self.words[addr]
                 self.fills += 1
                 await self._ack()
 
+    async def _delay(self):
+        cycles = self.jitter.randrange(0, 6) if self.jitter else self.latency
+        if cycles:
+            await ClockCycles(self.dut.clk, cycles)
+
     async def _ack(self):
         self.bus.pin7 = 1
         self.bus.apply()
-        await RisingEdge(self.dut.clk)
+        await ClockCycles(self.dut.clk, self.ack_cycles)
         self.bus.pin7 = 0
         self.bus.apply()
 
@@ -164,10 +171,10 @@ async def write(dut, bus, addr, value):
     return await access(dut, bus, addr, write_data=value)
 
 
-async def start_dut(dut):
+async def start_dut(dut, latency=MEM_LATENCY):
     cocotb.start_soon(Clock(dut.clk, CLOCK_PERIOD_US, unit="us").start())
     bus = await reset(dut)
-    mem = Memory(dut, bus)
+    mem = Memory(dut, bus, latency=latency)
     cocotb.start_soon(mem.run())
     return bus, mem
 
@@ -505,3 +512,150 @@ async def test_write_leaves_the_bus_to_the_caller(dut):
             )
             return
     raise AssertionError("write never completed")
+
+
+# ---------------------------------------------------------------------------
+# Deeper correctness
+# ---------------------------------------------------------------------------
+
+
+@cocotb.test()
+async def test_write_evicts_dirty_line(dut):
+    """A write that misses onto a dirty victim has to write that victim back
+    before installing itself. This path skips the fill, so it is its own case."""
+    bus, mem = await start_dut(dut)
+
+    await write(dut, bus, 0, 0x91)  # dirty in one way of set 0
+    await write(dut, bus, 4, 0x92)  # dirty in the other way
+
+    writebacks_before = mem.writebacks
+    await write(dut, bus, 8, 0x93)  # third address: must evict a dirty line
+
+    assert mem.writebacks == writebacks_before + 1, "dirty victim must be saved"
+    assert mem.words[0] == 0x91, (
+        f"evicted write landed wrong: memory[0] is {mem.words[0]:#04x}"
+    )
+
+    data, hit, _, _ = await read(dut, bus, 8)
+    assert hit == 1 and data == 0x93, "the new line must be installed correctly"
+
+    data, _, _, _ = await read(dut, bus, 4)
+    assert data == 0x92, "the surviving dirty line must be intact"
+
+
+@cocotb.test()
+async def test_ack_held_high_acks_once(dut):
+    """Memory that holds the acknowledgement high must not be read as two."""
+    cocotb.start_soon(Clock(dut.clk, CLOCK_PERIOD_US, unit="us").start())
+    bus = await reset(dut)
+    mem = Memory(dut, bus, ack_cycles=5)
+    cocotb.start_soon(mem.run())
+
+    data, _, was_miss, _ = await read(dut, bus, 7)
+    assert was_miss == 1
+    assert data == mem.words[7], "a long acknowledgement must still fill correctly"
+
+    data, hit, _, _ = await read(dut, bus, 7)
+    assert hit == 1 and data == mem.words[7]
+
+
+@cocotb.test()
+async def test_zero_latency_memory(dut):
+    """Memory that answers immediately must not race the handshake."""
+    bus, mem = await start_dut(dut, latency=0)
+
+    for addr in (2, 6, 10, 14):
+        data, _, _, _ = await read(dut, bus, addr)
+        assert data == mem.words[addr], f"addr {addr} wrong with instant memory"
+
+
+@cocotb.test()
+async def test_random_access_matches_reference(dut):
+    """The cache must be invisible. Whatever sequence of reads and writes is
+    thrown at it, a read returns the last value written to that address."""
+    import random
+
+    rng = random.Random(20260901)
+    bus, mem = await start_dut(dut)
+
+    reference = list(mem.words)
+
+    for step in range(300):
+        addr = rng.randrange(MEM_WORDS)
+        if rng.random() < 0.4:
+            value = rng.randrange(256)
+            await write(dut, bus, addr, value)
+            reference[addr] = value
+        else:
+            data, _, _, _ = await read(dut, bus, addr)
+            assert data == reference[addr], (
+                f"step {step}: read of addr {addr} returned {data:#04x}, "
+                f"expected {reference[addr]:#04x}"
+            )
+
+    # Everything still cached must also be correct after being flushed out.
+    for addr in range(MEM_WORDS):
+        data, _, _, _ = await read(dut, bus, addr)
+        assert data == reference[addr], (
+            f"final sweep: addr {addr} returned {data:#04x}, "
+            f"expected {reference[addr]:#04x}"
+        )
+
+
+@cocotb.test()
+async def test_reset_invalidates_everything(dut):
+    """Reset must clear the valid bits. Tags and data are deliberately not
+    reset, so a stale tag surviving a reset would return junk as a hit."""
+    bus, mem = await start_dut(dut)
+
+    for addr in range(4):
+        await read(dut, bus, addr)
+        await write(dut, bus, addr, 0xF0 | addr)
+
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 5)
+    dut.rst_n.value = 1
+    await RisingEdge(dut.clk)
+
+    for addr in range(4):
+        _, hit, was_miss, _ = await read(dut, bus, addr)
+        assert was_miss == 1 and hit == 0, (
+            f"addr {addr} hit after reset; valid bits were not cleared"
+        )
+
+    hits = await read_counter(dut, bus, select_miss=False)
+    misses = await read_counter(dut, bus, select_miss=True)
+    assert hits == 0, f"counters should have restarted, hit counter reads {hits}"
+    assert misses == 4, f"expected 4 post-reset misses, counter reads {misses}"
+
+
+@cocotb.test()
+async def test_random_access_with_jittering_memory(dut):
+    """Same reference check, but main memory answers after a random delay so
+    the handshake cannot rely on a fixed response time."""
+    import random
+
+    rng = random.Random(31415)
+    cocotb.start_soon(Clock(dut.clk, CLOCK_PERIOD_US, unit="us").start())
+    bus = await reset(dut)
+    mem = Memory(dut, bus, jitter=rng)
+    cocotb.start_soon(mem.run())
+
+    reference = list(mem.words)
+
+    for step in range(300):
+        addr = rng.randrange(MEM_WORDS)
+        if rng.random() < 0.5:
+            value = rng.randrange(256)
+            await write(dut, bus, addr, value)
+            reference[addr] = value
+        else:
+            data, _, _, _ = await read(dut, bus, addr)
+            assert data == reference[addr], (
+                f"step {step}: addr {addr} returned {data:#04x}, "
+                f"expected {reference[addr]:#04x}"
+            )
+
+    for addr in range(MEM_WORDS):
+        data, _, _, _ = await read(dut, bus, addr)
+        assert data == reference[addr], f"final sweep: addr {addr} wrong"
