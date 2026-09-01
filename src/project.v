@@ -16,79 +16,66 @@ module tt_um_sritejbommaraju_cache (
     input  wire       rst_n     // reset_n - low to reset
 );
 
-  // -------------------------------------------------------------------------
-  // Geometry
-  //
-  // A 5-bit address space (32 words of main memory) in front of a
-  // direct-mapped, write-back cache of 8 lines, one 8-bit word per line:
-  //
-  //     addr[4:0] = | tag[1:0] | index[2:0] |
-  //
-  // Eight lines needs three index bits, which leaves two tag bits. Four
-  // different addresses therefore share each line and evict one another,
-  // which is the defining behaviour of a direct-mapped cache.
-  // -------------------------------------------------------------------------
+  // 2-way set associative, write-back, 4 sets of 2 lines, one byte per line.
+  // addr[4:0] = | tag[2:0] | index[1:0] |
   localparam ADDR_BITS  = 5;
-  localparam INDEX_BITS = 3;
+  localparam INDEX_BITS = 2;
   localparam TAG_BITS   = ADDR_BITS - INDEX_BITS;
-  localparam LINES      = 1 << INDEX_BITS;
+  localparam SETS       = 1 << INDEX_BITS;
+  localparam LINES      = 2 * SETS;
   localparam CNT_BITS   = 5;
   localparam CNT_MAX    = {CNT_BITS{1'b1}};
 
-  // -------------------------------------------------------------------------
-  // Request interface, unpacked from the dedicated input pins
-  //
-  // ui_in[7] carries two unrelated meanings, because there is no spare pin
-  // and the two can never be needed at the same time:
-  //   - while the cache is talking to memory it is the memory's handshake,
-  //     meaning "fill data is on the bus" or "your writeback was accepted"
-  //   - while the cache is idle it selects which counter to display
-  // -------------------------------------------------------------------------
+  // ui_in[7] is the memory handshake during a transfer and the counter
+  // select while idle. The two can never be needed at the same time.
   wire [ADDR_BITS-1:0] req_addr  = ui_in[ADDR_BITS-1:0];
   wire                 req_start = ui_in[5];
   wire                 req_we    = ui_in[6];
   wire                 mem_ack   = ui_in[7];
   wire                 stat_sel  = ui_in[7];
 
-  // -------------------------------------------------------------------------
-  // Cache storage
-  //
-  // The tag and data arrays are deliberately not reset; a line is only ever
-  // read when its valid bit is set, and the valid bits are reset.
-  // -------------------------------------------------------------------------
+  // Lines are addressed as {way, index}. Tags and data are not reset because
+  // a line is only read when its valid bit is set.
   reg [TAG_BITS-1:0] tag_array   [0:LINES-1];
   reg                valid_array [0:LINES-1];
   reg                dirty_array [0:LINES-1];
   reg [7:0]          data_array  [0:LINES-1];
 
-  // -------------------------------------------------------------------------
-  // Latched request
-  // -------------------------------------------------------------------------
+  // One bit per set naming the way to replace next.
+  reg lru [0:SETS-1];
+
   reg [ADDR_BITS-1:0] addr_q;
   reg                 we_q;
+  reg                 way_q;
   reg [7:0]           wdata_q;
 
   wire [INDEX_BITS-1:0] index = addr_q[INDEX_BITS-1:0];
   wire [TAG_BITS-1:0]   tag   = addr_q[ADDR_BITS-1:INDEX_BITS];
 
-  // The lookup: a line hits only if it holds valid data AND that data belongs
-  // to the address we asked for.
-  wire line_valid = valid_array[index];
-  wire line_dirty = dirty_array[index];
-  wire tag_match  = (tag_array[index] == tag);
-  wire hit        = line_valid & tag_match;
+  wire [INDEX_BITS:0] line0 = {1'b0, index};
+  wire [INDEX_BITS:0] line1 = {1'b1, index};
 
-  // A line must be pushed back to memory before it is reused only if it holds
-  // something, and that something has been modified since it was fetched.
-  wire needs_writeback = line_valid & line_dirty;
+  // Both ways are compared at once. That parallel search is what associativity
+  // costs in silicon and what it buys in hit rate.
+  wire hit0 = valid_array[line0] & (tag_array[line0] == tag);
+  wire hit1 = valid_array[line1] & (tag_array[line1] == tag);
+  wire hit  = hit0 | hit1;
 
-  // The address the evicted line belongs to, which is not the address being
-  // requested. Main memory has no way to work this out, so we drive it out.
-  wire [ADDR_BITS-1:0] wb_addr = {tag_array[index], index};
+  // Fill an empty way before evicting anything; otherwise follow the LRU bit.
+  wire victim_way = !valid_array[line0] ? 1'b0
+                  : !valid_array[line1] ? 1'b1
+                  :                       lru[index];
 
-  // -------------------------------------------------------------------------
-  // Control FSM
-  // -------------------------------------------------------------------------
+  wire [INDEX_BITS:0] hit_line    = {hit1, index};
+  wire [INDEX_BITS:0] victim_line = {victim_way, index};
+  wire [INDEX_BITS:0] active_line = {way_q, index};
+
+  wire needs_writeback = valid_array[victim_line] & dirty_array[victim_line];
+
+  // The evicted line belongs to a different address than the one requested,
+  // and only the stored tag knows which.
+  wire [ADDR_BITS-1:0] wb_addr = {tag_array[active_line], index};
+
   localparam S_IDLE   = 3'd0;
   localparam S_LOOKUP = 3'd1;
   localparam S_WB     = 3'd2;
@@ -111,6 +98,7 @@ module tt_um_sritejbommaraju_cache (
       state      <= S_IDLE;
       addr_q     <= {ADDR_BITS{1'b0}};
       we_q       <= 1'b0;
+      way_q      <= 1'b0;
       wdata_q    <= 8'h00;
       data_q     <= 8'h00;
       hit_q      <= 1'b0;
@@ -121,11 +109,14 @@ module tt_um_sritejbommaraju_cache (
         valid_array[i] <= 1'b0;
         dirty_array[i] <= 1'b0;
       end
+      for (i = 0; i < SETS; i = i + 1) begin
+        lru[i] <= 1'b0;
+      end
     end else begin
       case (state)
 
-        // Wait for a request. Latch everything about it, so the rest of the
-        // transaction is immune to the caller changing its mind.
+        // Latch the whole request so the rest of the transaction is immune
+        // to the caller changing its mind.
         S_IDLE: begin
           hit_q  <= 1'b0;
           miss_q <= 1'b0;
@@ -139,27 +130,28 @@ module tt_um_sritejbommaraju_cache (
 
         S_LOOKUP: begin
           if (hit) begin
-            hit_q <= 1'b1;
+            hit_q      <= 1'b1;
+            way_q      <= hit1;
+            lru[index] <= ~hit1;  // the way we did not touch becomes the victim
             if (hit_count != CNT_MAX) hit_count <= hit_count + 1'b1;
             if (we_q) begin
-              // Write hit: update the line and mark it modified. Memory is
-              // not told; that is what makes this a write-back cache.
-              data_array[index]  <= wdata_q;
-              dirty_array[index] <= 1'b1;
-              data_q             <= wdata_q;
+              // Write hit updates the line only. Memory is told at eviction.
+              data_array[hit_line]  <= wdata_q;
+              dirty_array[hit_line] <= 1'b1;
+              data_q                <= wdata_q;
             end else begin
-              data_q <= data_array[index];
+              data_q <= data_array[hit_line];
             end
             state <= S_DONE;
           end else begin
             miss_q <= 1'b1;
+            way_q  <= victim_way;
             if (miss_count != CNT_MAX) miss_count <= miss_count + 1'b1;
             if (needs_writeback) begin
               state <= S_WB;
             end else if (we_q) begin
-              // Write miss with nothing to evict. The write covers the whole
-              // line, so there is no point fetching what we are about to
-              // overwrite: install it directly.
+              // A write covers the whole line, so there is nothing worth
+              // fetching before overwriting it.
               state <= S_ALLOC;
             end else begin
               state <= S_FILL;
@@ -167,39 +159,40 @@ module tt_um_sritejbommaraju_cache (
           end
         end
 
-        // Push the modified line back to memory before its line is reused.
+        // Push the modified line out before its slot is reused.
         S_WB: begin
           if (mem_ack) begin
-            dirty_array[index] <= 1'b0;
-            state              <= we_q ? S_ALLOC : S_FILL;
+            dirty_array[active_line] <= 1'b0;
+            state                    <= we_q ? S_ALLOC : S_FILL;
           end
         end
 
-        // Wait for main memory. However many cycles this takes is the miss
-        // penalty, and the reason the cache is worth having.
+        // However long this takes is the miss penalty.
         S_FILL: begin
           if (mem_ack) begin
-            data_array[index]  <= uio_in;
-            tag_array[index]   <= tag;
-            valid_array[index] <= 1'b1;
-            dirty_array[index] <= 1'b0;
-            data_q             <= uio_in;
-            state              <= S_DONE;
+            data_array[active_line]  <= uio_in;
+            tag_array[active_line]   <= tag;
+            valid_array[active_line] <= 1'b1;
+            dirty_array[active_line] <= 1'b0;
+            data_q                   <= uio_in;
+            lru[index]               <= ~way_q;
+            state                    <= S_DONE;
           end
         end
 
         // Install a line straight from the write data, without reading memory.
         S_ALLOC: begin
-          data_array[index]  <= wdata_q;
-          tag_array[index]   <= tag;
-          valid_array[index] <= 1'b1;
-          dirty_array[index] <= 1'b1;
-          data_q             <= wdata_q;
-          state              <= S_DONE;
+          data_array[active_line]  <= wdata_q;
+          tag_array[active_line]   <= tag;
+          valid_array[active_line] <= 1'b1;
+          dirty_array[active_line] <= 1'b1;
+          data_q                   <= wdata_q;
+          lru[index]               <= ~way_q;
+          state                    <= S_DONE;
         end
 
         // Hold the result until the caller drops start, so a level-held
-        // request cannot be mistaken for a second transaction.
+        // request is not mistaken for a second transaction.
         S_DONE: begin
           if (!req_start) state <= S_IDLE;
         end
@@ -209,21 +202,12 @@ module tt_um_sritejbommaraju_cache (
     end
   end
 
-  // -------------------------------------------------------------------------
-  // Outputs
-  //
-  // There are more things worth reporting than there are output pins, so the
-  // low five are shared four ways, and the three status pins above them say
-  // which meaning is live: the address during a memory transfer, the result
-  // flags once ready, and otherwise one of the two counters.
-  // -------------------------------------------------------------------------
   wire ready   = (state == S_DONE);
   wire mem_req = (state == S_FILL);
   wire mem_we  = (state == S_WB);
 
-  // ready, mem_req and mem_we each get a pin of their own. They are mutually
-  // exclusive, and between them they say unambiguously what the low five pins
-  // currently mean - which matters because those five are shared three ways.
+  // The low five pins are shared four ways. ready, mem_we and mem_req are
+  // mutually exclusive and say which meaning is live.
   wire [4:0] uo_low = mem_we  ? wb_addr
                     : mem_req ? addr_q
                     : ready   ? {3'b000, miss_q, hit_q}
@@ -231,11 +215,8 @@ module tt_um_sritejbommaraju_cache (
 
   assign uo_out = {ready, mem_we, mem_req, uo_low};
 
-  // The cache drives the shared data bus only when it has something to put
-  // there: the evicted word during a writeback, or the result once ready. At
-  // every other time it lets go, which is what allows main memory and the
-  // caller to use the very same pins.
-  assign uio_out = mem_we ? data_array[index] : data_q;
+  // The cache drives the shared bus only when it has something to put there.
+  assign uio_out = mem_we ? data_array[active_line] : data_q;
   assign uio_oe  = (mem_we | ready) ? 8'hFF : 8'h00;
 
   // List all unused inputs to prevent warnings

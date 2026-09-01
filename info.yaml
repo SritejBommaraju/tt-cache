@@ -3,7 +3,7 @@ project:
   title:        "Tiny Cache"      # Project title
   author:       "Sritej Bommaraju"      # Your name
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "A direct-mapped write-back cache with an off-chip memory interface"      # One line description of what your project does
+  description:  "A 2-way set associative write-back cache with LRU replacement"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     50000000       # Clock frequency in Hz (or 0 if not applicable)
 

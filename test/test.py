@@ -9,9 +9,16 @@ CLOCK_PERIOD_US = 10
 
 ADDR_BITS = 5
 MEM_WORDS = 1 << ADDR_BITS
-INDEX_BITS = 3
-LINES = 1 << INDEX_BITS
+INDEX_BITS = 2
+SETS = 1 << INDEX_BITS
+WAYS = 2
+LINES = SETS * WAYS
 CNT_MAX = 31
+
+
+def index_of(addr):
+    """Which set an address maps to."""
+    return addr % SETS
 
 # uo_out bit positions. ready / mem_we / mem_req are dedicated; the low five
 # pins mean different things depending on which of those three is asserted.
@@ -214,26 +221,61 @@ async def test_all_lines_independent(dut):
 
 
 @cocotb.test()
-async def test_conflict_miss(dut):
-    """Addresses sharing an index evict each other. This is the defining
-    weakness of a direct-mapped cache."""
+async def test_two_ways_coexist(dut):
+    """Two addresses in one set now live side by side. A direct-mapped cache
+    of the same capacity could not hold both."""
     bus, mem = await start_dut(dut)
 
-    assert (0 % LINES) == (8 % LINES), "0 and 8 must share an index"
+    assert index_of(0) == index_of(4), "0 and 4 must share a set"
 
-    _, _, was_miss, _ = await read(dut, bus, 0)
-    assert was_miss == 1, "cold miss on 0"
+    await read(dut, bus, 0)
+    await read(dut, bus, 4)
 
-    _, was_hit, _, _ = await read(dut, bus, 0)
-    assert was_hit == 1, "0 is now cached"
+    data0, hit0, _, _ = await read(dut, bus, 0)
+    data4, hit4, _, _ = await read(dut, bus, 4)
 
-    # Evicts address 0 even though seven other lines are free.
-    _, _, was_miss, _ = await read(dut, bus, 8)
-    assert was_miss == 1, "cold miss on 8"
+    assert hit0 == 1, "0 must survive the fetch of 4"
+    assert hit4 == 1, "4 must be cached too"
+    assert data0 == mem.words[0] and data4 == mem.words[4]
 
-    data, _, was_miss, _ = await read(dut, bus, 0)
-    assert was_miss == 1, "0 must have been evicted by 8 - they share an index"
-    assert data == mem.words[0], "the refetched data must still be correct"
+
+@cocotb.test()
+async def test_third_address_in_set_evicts(dut):
+    """Associativity raises the conflict threshold, it does not remove it.
+    Three addresses in one set still do not fit in two ways."""
+    bus, mem = await start_dut(dut)
+
+    for addr in (0, 4, 8):
+        assert index_of(addr) == 0
+
+    await read(dut, bus, 0)
+    await read(dut, bus, 4)
+    await read(dut, bus, 8)
+
+    # Check the survivor first. Probing the evicted address is itself a miss,
+    # which would evict the survivor before we got to look at it.
+    _, hit4, _, _ = await read(dut, bus, 4)
+    assert hit4 == 1, "4 was used more recently and must survive"
+
+    _, _, miss0, _ = await read(dut, bus, 0)
+    assert miss0 == 1, "0 was the least recently used and must be gone"
+
+
+@cocotb.test()
+async def test_lru_evicts_least_recently_used(dut):
+    """Touching a line protects it. The other way goes instead."""
+    bus, mem = await start_dut(dut)
+
+    await read(dut, bus, 0)
+    await read(dut, bus, 4)
+    await read(dut, bus, 0)  # 0 is now the most recently used of the pair
+    await read(dut, bus, 8)  # so 4 is the one that should be evicted
+
+    _, hit0, _, _ = await read(dut, bus, 0)
+    assert hit0 == 1, "0 was touched most recently and must survive"
+
+    _, _, miss4, _ = await read(dut, bus, 4)
+    assert miss4 == 1, "4 was least recently used and must have been evicted"
 
 
 @cocotb.test()
@@ -307,11 +349,12 @@ async def test_dirty_eviction_writes_back(dut):
     address - not the address being fetched."""
     bus, mem = await start_dut(dut)
 
-    await write(dut, bus, 0, 0x77)  # line 0 is now dirty
+    await write(dut, bus, 0, 0x77)  # dirty, in one way of set 0
     assert mem.words[0] != 0x77, "not written through"
+    await read(dut, bus, 4)  # fills the other way of the same set
 
     writebacks_before = mem.writebacks
-    await read(dut, bus, 8)  # same index, different tag: forces eviction
+    await read(dut, bus, 8)  # a third address in the set forces an eviction
 
     assert mem.writebacks == writebacks_before + 1, "eviction must write back"
     assert mem.words[0] == 0x77, (
@@ -329,6 +372,7 @@ async def test_clean_eviction_skips_writeback(dut):
     bus, mem = await start_dut(dut)
 
     await read(dut, bus, 0)  # clean
+    await read(dut, bus, 4)  # fills the other way
     writebacks_before = mem.writebacks
     await read(dut, bus, 8)  # evicts a clean line
 
@@ -349,7 +393,8 @@ async def test_repeated_writes_evict_once(dut):
 
     assert mem.writebacks == writebacks_before, "still no eviction"
 
-    await read(dut, bus, 8)  # force it out
+    await read(dut, bus, 4)  # fills the other way of the set
+    await read(dut, bus, 8)  # force address 0 out
     assert mem.writebacks == writebacks_before + 1, (
         "ten writes must produce exactly one writeback"
     )

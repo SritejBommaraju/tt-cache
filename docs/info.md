@@ -9,19 +9,25 @@ You can also include images in this folder and reference them in the markdown. E
 
 ## How it works
 
-This is a direct-mapped, write-back cache. It sits between a caller and a main
-memory that lives off-chip, and its job is to answer repeat requests without
-paying the cost of reaching that memory again.
+This is a 2-way set associative, write-back cache. It sits between a caller and
+a main memory that lives off-chip, and its job is to answer repeat requests
+without paying the cost of reaching that memory again.
 
-The cache holds 8 lines of one 8-bit word each, in front of a 5-bit (32 word)
-address space. An address is split as:
+The cache holds 8 lines of one 8-bit word each, arranged as 4 sets of 2 ways,
+in front of a 5-bit (32 word) address space. An address is split as:
 
-    addr[4:0] = | tag[1:0] | index[2:0] |
+    addr[4:0] = | tag[2:0] | index[1:0] |
 
-The index selects one of the 8 lines. The tag records which of the 4 addresses
-sharing that index is stored there. A valid bit records whether the line holds
-anything, and a dirty bit records whether it has been modified since it was
-fetched. A request hits only when the line is valid and its tag matches.
+The index selects a set, and both ways of that set are searched at the same
+time. The tag records which address is stored in a way, a valid bit records
+whether it holds anything, and a dirty bit records whether it has been modified
+since it was fetched. A request hits when either way is valid with a matching
+tag.
+
+Because a set has two ways, two addresses that map to the same set can be
+cached at once. When a third arrives, one has to go: the cache fills an empty
+way if there is one, and otherwise evicts the least recently used way, tracked
+by a single LRU bit per set.
 
 Reads that miss raise `MEM_REQ` with the wanted address on `MADDR`, and wait for
 main memory to place the word on the data bus and pulse `MEM_ACK`.
@@ -39,10 +45,10 @@ A write that misses does not fetch the line first. With one word per line the
 write covers the line completely, so the fetched word would be discarded
 immediately; the cache installs the line directly from the write data instead.
 
-Because the cache is direct-mapped, an address has exactly one line it may
-occupy. Addresses 0, 8, 16 and 24 all map to index 0, so touching them
-alternately evicts one another even while the other seven lines sit empty.
-That is a conflict miss, and it is the characteristic weakness of this design.
+Associativity raises the conflict threshold but does not remove it. Addresses
+0, 4, 8, 12 and so on all map to set 0, so any two of them coexist, but a third
+forces an eviction. Alternating between three addresses in one set still misses
+every time.
 
 Two 5-bit saturating counters record hits and misses. They saturate rather than
 wrap, so a large count can never be mistaken for a small one.
@@ -74,10 +80,12 @@ The sequences worth trying:
 
 - read an address, then read it again - the second is a hit and takes fewer
   cycles
-- read an address, then one 8 apart, then the first again - it misses, because
-  the second evicted it
-- write an address several times, then read something 8 apart - exactly one
-  writeback happens, carrying only the final value
+- read addresses 0 and 4, then both again - both hit, because they occupy
+  different ways of the same set
+- read 0, then 4, then 8 - the third forces out the least recently used of the
+  first two
+- write an address several times, then fill the set - exactly one writeback
+  happens, carrying only the final value
 - while idle, read the hit counter on `uo[4:0]`, or the miss counter by raising
   `MEM_ACK`
 
