@@ -26,8 +26,8 @@ module tt_um_sritejbommaraju_cache (
   localparam CNT_BITS   = 5;
   localparam CNT_MAX    = {CNT_BITS{1'b1}};
 
-  // ui_in[7] is the memory handshake during a transfer and the counter
-  // select while idle. The two can never be needed at the same time.
+  // ui_in[7] is the memory handshake during a transfer and the counter select
+  // while idle, so it only acknowledges on a rising edge, never on a level.
   wire [ADDR_BITS-1:0] req_addr  = ui_in[ADDR_BITS-1:0];
   wire                 req_start = ui_in[5];
   wire                 req_we    = ui_in[6];
@@ -43,6 +43,9 @@ module tt_um_sritejbommaraju_cache (
 
   // One bit per set naming the way to replace next.
   reg lru [0:SETS-1];
+
+  reg                 mem_ack_q;
+  wire                mem_ack_edge = mem_ack & ~mem_ack_q;
 
   reg [ADDR_BITS-1:0] addr_q;
   reg                 we_q;
@@ -96,6 +99,7 @@ module tt_um_sritejbommaraju_cache (
   always @(posedge clk) begin
     if (!rst_n) begin
       state      <= S_IDLE;
+      mem_ack_q  <= 1'b0;
       addr_q     <= {ADDR_BITS{1'b0}};
       we_q       <= 1'b0;
       way_q      <= 1'b0;
@@ -113,6 +117,7 @@ module tt_um_sritejbommaraju_cache (
         lru[i] <= 1'b0;
       end
     end else begin
+      mem_ack_q <= mem_ack;
       case (state)
 
         // Latch the whole request so the rest of the transaction is immune
@@ -161,7 +166,7 @@ module tt_um_sritejbommaraju_cache (
 
         // Push the modified line out before its slot is reused.
         S_WB: begin
-          if (mem_ack) begin
+          if (mem_ack_edge) begin
             dirty_array[active_line] <= 1'b0;
             state                    <= we_q ? S_ALLOC : S_FILL;
           end
@@ -169,7 +174,7 @@ module tt_um_sritejbommaraju_cache (
 
         // However long this takes is the miss penalty.
         S_FILL: begin
-          if (mem_ack) begin
+          if (mem_ack_edge) begin
             data_array[active_line]  <= uio_in;
             tag_array[active_line]   <= tag;
             valid_array[active_line] <= 1'b1;
@@ -215,9 +220,10 @@ module tt_um_sritejbommaraju_cache (
 
   assign uo_out = {ready, mem_we, mem_req, uo_low};
 
-  // The cache drives the shared bus only when it has something to put there.
+  // The cache drives the shared bus only when it has something to return.
+  // A write returns nothing and the caller still owns the bus, so it stays off.
   assign uio_out = mem_we ? data_array[active_line] : data_q;
-  assign uio_oe  = (mem_we | ready) ? 8'hFF : 8'h00;
+  assign uio_oe  = (mem_we | (ready & ~we_q)) ? 8'hFF : 8'h00;
 
   // List all unused inputs to prevent warnings
   wire _unused = &{ena, 1'b0};

@@ -30,7 +30,9 @@ way if there is one, and otherwise evicts the least recently used way, tracked
 by a single LRU bit per set.
 
 Reads that miss raise `MEM_REQ` with the wanted address on `MADDR`, and wait for
-main memory to place the word on the data bus and pulse `MEM_ACK`.
+main memory to place the word on the data bus and pulse `MEM_ACK`. `MEM_ACK` is
+acted on when it rises, not while it is high, because the same pin selects which
+counter to display when the cache is idle.
 
 Writes are held in the cache and not passed on, which is what makes this a
 write-back cache: a write hit updates the line and sets its dirty bit, and
@@ -67,14 +69,23 @@ say which meaning is live:
 ## How to test
 
 Drive an address on `ADDR[4:0]`, set `WE` for a write (with the data on the
-bidirectional bus), and hold `START` high. When `READY` goes high the access has
-completed: `uo[0]` says it hit, `uo[1]` says it missed, and for a read the word
-is on the data bus. Drop `START` to return the cache to idle.
+bidirectional bus), and hold `START` high until `READY` appears. When `READY`
+goes high the access has completed: `uo[0]` says it hit, `uo[1]` says it missed,
+and for a read the word is on the data bus. Drop `START` to return the cache to
+idle.
+
+On a read the cache drives the data bus once it is ready. On a write it never
+drives the bus, because the caller is still presenting the write data on those
+same pins.
+
+`READY` is held for as long as `START` is held, so a caller that releases `START`
+early can miss it.
 
 While `START` is held, watch the two memory pins. If `MEM_REQ` goes high, place
 the word for the address on `MADDR` onto the data bus and pulse `MEM_ACK`. If
 `MEM_WE` goes high, store the byte on the data bus at the address on `MADDR`,
-then pulse `MEM_ACK`.
+then pulse `MEM_ACK`. Drive `MEM_ACK` low first and then high, since only the
+rising edge counts.
 
 The sequences worth trying:
 

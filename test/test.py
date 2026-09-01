@@ -144,7 +144,11 @@ async def access(dut, bus, addr, write_data=None, timeout=200):
     data = int(dut.uio_out.value)
     was_hit = bit(uo, HIT)
     was_miss = bit(uo, MISS)
-    assert int(dut.uio_oe.value) == 0xFF, "cache must drive uio while ready"
+    # A read is answered on the bus; a write leaves it to the caller.
+    expected_oe = 0x00 if write_data is not None else 0xFF
+    assert int(dut.uio_oe.value) == expected_oe, (
+        f"uio_oe was {int(dut.uio_oe.value):#04x}, expected {expected_oe:#04x}"
+    )
 
     bus.start = 0
     bus.apply()
@@ -445,3 +449,59 @@ async def test_counters_saturate(dut):
         await read(dut, bus, 0)
 
     assert await read_counter(dut, bus, select_miss=False) == CNT_MAX, "hits must saturate"
+
+
+# ---------------------------------------------------------------------------
+# Regressions for bugs found by audit
+# ---------------------------------------------------------------------------
+
+
+@cocotb.test()
+async def test_ack_is_edge_sensitive(dut):
+    """ui_in[7] doubles as the counter select. If it is still high when a
+    request misses, it must not be mistaken for a memory acknowledgement."""
+    cocotb.start_soon(Clock(dut.clk, CLOCK_PERIOD_US, unit="us").start())
+    bus = await reset(dut)
+
+    # Deliberately no memory model. Nothing can legitimately complete a fill.
+    bus.pin7 = 1     # as if the caller had just read the miss counter
+    bus.data = 0xEE  # junk left on the bus
+    bus.apply()
+    await RisingEdge(dut.clk)
+
+    bus.addr = 9
+    bus.start = 1
+    bus.apply()
+
+    for cycle in range(20):
+        await RisingEdge(dut.clk)
+        if bit(int(dut.uo_out.value), READY):
+            raise AssertionError(
+                f"fill completed at cycle {cycle} with no memory present, "
+                f"returning {int(dut.uio_out.value):#04x}"
+            )
+
+    assert bit(int(dut.uo_out.value), MEM_REQ) == 1, "cache should still be waiting"
+
+
+@cocotb.test()
+async def test_write_leaves_the_bus_to_the_caller(dut):
+    """The caller drives its write data until it sees READY, so the cache must
+    not drive the same pins at that moment."""
+    bus, _ = await start_dut(dut)
+
+    bus.addr = 6
+    bus.we = 1
+    bus.data = 0x3C
+    bus.start = 1
+    bus.apply()
+
+    for _ in range(20):
+        await RisingEdge(dut.clk)
+        if bit(int(dut.uo_out.value), READY):
+            oe = int(dut.uio_oe.value)
+            assert oe == 0x00, (
+                f"cache drove uio_oe={oe:#04x} while the caller still owns the bus"
+            )
+            return
+    raise AssertionError("write never completed")
