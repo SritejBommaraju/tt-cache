@@ -3,7 +3,7 @@ project:
   title:        "Tiny Cache"      # Project title
   author:       "Sritej Bommaraju"      # Your name
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "A direct-mapped cache with an off-chip memory interface"      # One line description of what your project does
+  description:  "A direct-mapped write-back cache with an off-chip memory interface"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     50000000       # Clock frequency in Hz (or 0 if not applicable)
 
@@ -30,17 +30,17 @@ pinout:
   ui[4]: "ADDR4"
   ui[5]: "START"
   ui[6]: "WE"
-  ui[7]: "MEM_VALID"
+  ui[7]: "MEM_ACK"
 
   # Outputs
-  uo[0]: "READY"
-  uo[1]: "HIT"
-  uo[2]: "MISS"
-  uo[3]: "MEM_REQ"
-  uo[4]: "STATE0"
-  uo[5]: "STATE1"
-  uo[6]: "BUSY"
-  uo[7]: ""
+  uo[0]: "MADDR0"
+  uo[1]: "MADDR1"
+  uo[2]: "MADDR2"
+  uo[3]: "MADDR3"
+  uo[4]: "MADDR4"
+  uo[5]: "MEM_REQ"
+  uo[6]: "MEM_WE"
+  uo[7]: "READY"
 
   # Bidirectional pins
   uio[0]: "DATA0"
