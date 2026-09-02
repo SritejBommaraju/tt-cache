@@ -184,7 +184,7 @@ gtkwave test/tb.fst test/tb.gtkw   # or: surfer test/tb.fst
 
 ## Test coverage
 
-23 cocotb tests. Main memory is modelled as an autonomous background task that
+29 cocotb tests. Main memory is modelled as an autonomous background task that
 keeps no model of the cache: everything it needs arrives on the pins.
 
 | Area | Covers |
@@ -194,6 +194,7 @@ keeps no model of the cache: everything it needs arrives on the pins.
 | Write path | Write hit, deferred memory update, no-fetch write miss, dirty and clean eviction, writeback addressing, one writeback per ten writes |
 | Protocol | Bus ownership, edge-sensitive acknowledge, held acknowledge, zero-latency memory, reset invalidation |
 | Counters | Counting and saturation |
+| Workload | Hit rate under six access patterns, from tight loops to full thrash |
 
 Two of them run **300 random reads and writes against a reference model** and then
 sweep all 32 addresses, one with a fixed memory latency and one with the memory
@@ -204,11 +205,13 @@ single property: a read returns the last value written to that address.
 
 | Check | Result |
 | --- | --- |
-| RTL simulation | 23 / 23 |
-| Gate level simulation | 23 / 23 |
+| RTL simulation | 29 / 29 |
+| Gate level simulation | 29 / 29 |
 | LibreLane hardening | pass |
 | Tiny Tapeout precheck | pass |
-| Timing signoff | No setup or hold violations |
+| Timing signoff | No setup, hold, max cap or max slew violations, all three corners |
+
+### Physical
 
 | Metric | Value |
 | --- | --- |
@@ -217,10 +220,55 @@ single property: a read returns the last value written to that address.
 | Cells | 833 |
 | Flip-flops | 152 |
 | Sequential share of area | 51% |
-| Clock | 50 MHz |
 
-Storage dominates. Doubling the cache would not double the design, but it would
-add roughly 104 flip-flops to the half that is already the majority.
+### Timing
+
+| Metric | Value |
+| --- | --- |
+| Configured clock | 50 MHz, 20 ns period |
+| Worst setup slack | 10.47 ns (slow corner, 1.08 V, 125 C) |
+| Worst hold slack | 0.12 ns (fast corner, 1.32 V, -40 C) |
+| Critical path | `ui_in[7]` to `uo_out[1]`, through the status and counter output mux |
+| Estimated maximum | About 105 MHz on this netlist, allowing Tiny Tapeout's 8 ns of IO budget |
+
+The critical path is not the tag comparison. It is the combinational path from the
+counter select pin, through the four way multiplexer on the low output pins, to the
+pins themselves. The tag compare has a whole state to settle in; that mux does not.
+
+### Power
+
+At 50 MHz in the slow corner, total 735 uW:
+
+| Group | Power | Share |
+| --- | --- | --- |
+| Sequential | 347 uW | 47.3% |
+| Clock network | 320 uW | 43.6% |
+| Combinational | 67 uW | 9.1% |
+| Leakage | 1.4 uW | 0.2% |
+
+Flip-flops and the clock tree that drives them are 91% of the power, matching the
+51% of area they occupy. Storage dominates both. Doubling the cache would not
+double the design, but it would add roughly 104 flip-flops to the half that is
+already the majority.
+
+### Hit rate
+
+Correctness tests say nothing about effectiveness, so `test/test_workload.py`
+measures it directly:
+
+| Access pattern | Hit rate |
+| --- | --- |
+| Tight loop over 4 addresses | 96.0% |
+| Loop over 8 addresses, exactly capacity | 93.3% |
+| 85% hot working set of 6, 15% cold | 75.0% |
+| Uniform random over all 32 addresses | 25.0% |
+| Three addresses in one set, alternating | 0.0% |
+| Sequential scan of all 32 addresses | 0.0% |
+
+Two of those are worth dwelling on. Uniform random lands on 25.0%, which is exactly
+the fraction of memory the cache holds: with no locality to exploit, a cache is
+worth only its size. And three addresses cycling through one two-way set hit
+**never**, because each one evicts the one that will be needed next.
 
 ## Repository layout
 
@@ -228,7 +276,8 @@ add roughly 104 flip-flops to the half that is already the majority.
 | --- | --- |
 | `src/project.v` | The cache |
 | `src/config.json` | LibreLane configuration |
-| `test/test.py` | Tests and the main memory model |
+| `test/test.py` | Correctness tests and the main memory model |
+| `test/test_workload.py` | Hit rate measurement under different access patterns |
 | `test/tb.v` | Simulation wrapper |
 | `test/Makefile` | RTL and gate level builds |
 | `info.yaml` | Submission manifest |
